@@ -1,17 +1,20 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import cors from 'cors';
 import db from './dbConnection.js';
 import router from './routes/userRoutes.js';
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Enable CORS for all routes
+app.use(cors());
+
 // Middleware
 app.use(express.json());
 
 // Routes
-// const sampleRoutes = require('./routes/sampleRoutes');
-// app.use('/api', sampleRoutes);
+
 
 app.get("/", (req, res) => {
   res.send(`

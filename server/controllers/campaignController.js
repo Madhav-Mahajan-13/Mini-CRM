@@ -106,7 +106,7 @@ const buildCustomerQuery = (rules, countOnly = false) => {
                 fieldName = 'total_visits';
                 break;
             case 'Last Visit Date':
-                fieldName = 'last_visit_date';
+                fieldName = 'last_visit';
                 break;
             default:
                 throw new Error(`Unknown field: ${rule.field}`);
@@ -232,7 +232,8 @@ export const previewaudience = async (req, res) => {
 // Create campaign function
 export const createCampaign = async (req, res) => {
     const { name, message_template, rules_json } = req.body;
-    const userId = req.user.id; // assuming user ID is available in req.user
+    const userId = 1; // assuming user ID is available in req.user
+    // const userId = req.user.id; // assuming user ID is available in req.user
 
     try {
         // Input validation
@@ -289,7 +290,7 @@ export const createCampaign = async (req, res) => {
                 // Step 4: Add customer to campaign_customers connection table
                 const connectionQuery = `
                     INSERT INTO campaign_customers (campaign_id, customer_id, status, created_at) 
-                    VALUES ($1, $2, 'pending', NOW()) 
+                    VALUES ($1, $2, 'PENDING', NOW()) 
                     RETURNING id
                 `;
                 const connectionResult = await db.query(connectionQuery, [campaignId, customer.id]);
@@ -299,7 +300,7 @@ export const createCampaign = async (req, res) => {
                 const emailResult = await sendCampaignEmail(customer, message_template, name);
                 
                 // Step 6: Update status based on email result
-                const status = emailResult.success ? 'sent' : 'failed';
+                const status = emailResult.success ? 'SENT' : 'FAILED';
                 const updateQuery = `
                     UPDATE campaign_customers 
                     SET status = $1, sent_at = $2, error_message = $3 
