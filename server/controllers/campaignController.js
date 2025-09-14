@@ -4,23 +4,61 @@ import nodemailer from 'nodemailer'; // For sending emails
 
 export const getCampaign = async (req, res) => {
     try {
-        const campaigns = await db.query(`SELECT c.id,c.name as campaign_name,c.message_template,c.rules_json,u.name,u.email,c.created_at FROM campaigns C
-                                          join users u 
-                                          on C.created_by = u.id
-                                          order by c.created_at desc`);
-        if (campaigns.rows.length === 0) {
+        const query = `
+            SELECT 
+                c.id,
+                c.name,
+                c.message_template,
+                c.rules_json,
+                c.total_recipients,
+                c.emails_sent,
+                c.emails_failed,
+                c.status AS campaign_status,
+                u.name AS created_by_name,
+                u.email AS created_by_email,
+                c.created_at
+            FROM campaigns c
+            JOIN users u ON c.created_by = u.id
+            ORDER BY c.created_at DESC
+        `;
+
+        const result = await db.query(query);
+
+        if (result.rows.length === 0) {
             return res.status(404).json({ message: "No campaigns found" });
         }
-        const data = { campaigns: campaigns.rows,
-                    total: campaigns.rows.length,
-         };
-        res.status(200).json(data);
+
+        const campaigns = result.rows.map(c => ({
+            id: c.id,
+            name: c.name,
+            date: c.created_at ? new Date(c.created_at).toISOString().split('T')[0] : null,
+            audienceSize: Number(c.total_recipients) || 0,
+            sent: Number(c.emails_sent) || 0,
+            failed: Number(c.emails_failed) || 0,
+            pending: Math.max((Number(c.total_recipients) || 0) 
+                               - (Number(c.emails_sent) || 0) 
+                               - (Number(c.emails_failed) || 0), 0),
+            messageTemplate: c.message_template,
+            rules: typeof c.rules_json === 'string' ? JSON.parse(c.rules_json) : c.rules_json,
+            createdBy: {
+                name: c.created_by_name,
+                email: c.created_by_email
+            },
+            status: c.campaign_status,
+            createdAt: c.created_at
+        }));
+
+        res.status(200).json({
+            campaigns,
+            total: campaigns.length
+        });
+
     } catch (error) {
         console.error("Error fetching campaigns:", error);
-        res.status(500).json({ message: "Server error" });  
-        
+        res.status(500).json({ message: "Server error while fetching campaigns" });
     }
 };
+
 
 
 
