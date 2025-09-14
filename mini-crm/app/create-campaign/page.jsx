@@ -60,7 +60,7 @@ export default function CreateCampaignPage() {
     console.log("Previewing audience with rules:", validRules)
     setIsLoadingPreview(true)
     try {
-      const response = await fetch('/api/audience-preview', {
+      const response = await fetch('http://localhost:5000/api/users/audience-preview', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -135,7 +135,7 @@ export default function CreateCampaignPage() {
 
       console.log("Submitting campaign data:", campaignData)
 
-      const response = await fetch('/api/campaigns/create', {
+      const response = await fetch('http://localhost:5000/api/users/campaigns/create', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -281,7 +281,7 @@ export default function CreateCampaignPage() {
                         onValueChange={(value) => updateRule(index, "logic", value)}
                       >
                         <SelectTrigger className="w-20">
-                          <SelectValue />
+                          <SelectValue placeholder="Logic" />
                         </SelectTrigger>
                         <SelectContent>
                           {logicOptions.map((option) => (
