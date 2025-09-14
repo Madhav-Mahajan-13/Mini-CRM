@@ -1,4 +1,3 @@
-// import db from "../..dbConnection.js"; // Adjust path as needed
 import db from "../../dbConnection.js";
 import { buildCustomerQuery } from "../utils/query.builder.js";
 
@@ -12,7 +11,7 @@ export const findAllCampaigns = async () => {
         ORDER BY c.created_at DESC
     `;
     const result = await db.query(query);
-    // Format data here to match frontend expectations
+
     return result.rows.map(c => ({
         id: c.id,
         name: c.name,
@@ -37,8 +36,10 @@ export const countCustomersByRules = async (rules) => {
 
 export const createCampaign = async (campaignData) => {
     const query = `
-        INSERT INTO campaigns (name, message_template, rules_json, created_by, total_recipients, status, created_at) 
-        VALUES ($1, $2, $3, $4, $5, 'PENDING', NOW()) 
+        INSERT INTO campaigns 
+            (name, message_template, rules_json, created_by, total_recipients, status, created_at) 
+        VALUES 
+            ($1, $2, $3, $4, $5, 'PENDING', NOW()) 
         RETURNING *;
     `;
     const values = [
@@ -53,19 +54,18 @@ export const createCampaign = async (campaignData) => {
 };
 
 export const createCommunicationLogs = async (campaignId, customerIds) => {
-    // This uses a bulk-insert technique for better performance
-    let query = 'INSERT INTO communication_logs (campaign_id, customer_id, status) VALUES ';
+    let query = `
+        INSERT INTO campaign_customers (campaign_id, customer_id, status, created_at) VALUES 
+    `;
     const values = [];
     let paramIndex = 1;
 
     for (const customerId of customerIds) {
-        query += `($${paramIndex++}, $${paramIndex++}, 'PENDING'),`;
+        query += `($${paramIndex++}, $${paramIndex++}, 'PENDING', NOW()),`;
         values.push(campaignId, customerId);
     }
 
-    // Remove trailing comma and add semicolon
     query = query.slice(0, -1) + ';';
-    
     await db.query(query, values);
 };
 
@@ -73,16 +73,15 @@ export const findPendingLogsForCampaign = async (campaignId) => {
     const query = `
         SELECT 
             cl.id, 
-            c.id as customer_id, c.name as customer_name, c.email as customer_email,
-            cmp.name as campaign_name, cmp.message_template
-        FROM communication_logs cl
+            c.id AS customer_id, c.name AS customer_name, c.email AS customer_email,
+            cmp.name AS campaign_name, cmp.message_template
+        FROM campaign_customers cl
         JOIN customers c ON cl.customer_id = c.id
         JOIN campaigns cmp ON cl.campaign_id = cmp.id
         WHERE cl.campaign_id = $1 AND cl.status = 'PENDING';
     `;
     const result = await db.query(query, [campaignId]);
     
-    // Structure the data nicely for the email service
     return result.rows.map(row => ({
         id: row.id,
         customer: { id: row.customer_id, name: row.customer_name, email: row.customer_email },
@@ -92,8 +91,8 @@ export const findPendingLogsForCampaign = async (campaignId) => {
 
 export const updateLogStatus = async (logId, status, errorMessage) => {
     const query = `
-        UPDATE communication_logs 
-        SET status = $1, error_message = $2, processed_at = NOW()
+        UPDATE campaign_customers 
+        SET status = $1, error_message = $2, sent_at = NOW()
         WHERE id = $3;
     `;
     await db.query(query, [status, errorMessage, logId]);
