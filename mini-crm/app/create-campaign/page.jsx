@@ -146,6 +146,11 @@ export default function CreateCampaignPage() {
       if (response.ok) {
         const result = await response.json()
         console.log("Campaign created successfully:", result)
+        
+        // --- INTENTIONAL DELAY ADDED HERE ---
+        // Wait for 2 seconds to give user feedback before redirecting
+        await new Promise(resolve => setTimeout(resolve, 2000)); 
+        
         router.push("/")
       } else {
         const errorData = await response.json()
