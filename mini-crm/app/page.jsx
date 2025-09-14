@@ -1,49 +1,36 @@
 "use client"
+import { useEffect, useState } from "react"
+import { useRouter } from "next/navigation"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { User, Plus } from "lucide-react"
-import { useRouter } from "next/navigation"
 
 export default function CampaignHistoryPage() {
   const router = useRouter()
+  const [campaigns, setCampaigns] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
 
-  // TODO: Fetch campaign data from API route /api/campaigns
-  const campaignData = [
-    {
-      id: 1,
-      name: "Black Friday Sale",
-      date: "2024-01-15",
-      audienceSize: 2847,
-      sent: 2847,
-      failed: 12,
-    },
-    {
-      id: 2,
-      name: "New Product Launch",
-      date: "2024-01-10",
-      audienceSize: 1523,
-      sent: 1523,
-      failed: 8,
-    },
-    {
-      id: 3,
-      name: "Customer Retention",
-      date: "2024-01-05",
-      audienceSize: 892,
-      sent: 892,
-      failed: 3,
-    },
-    {
-      id: 4,
-      name: "Welcome Series",
-      date: "2024-01-01",
-      audienceSize: 1247,
-      sent: 1247,
-      failed: 15,
-    },
-  ]
+  useEffect(() => {
+    const fetchCampaigns = async () => {
+      try {
+        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000";
+        const res = await fetch(`${backendUrl}/api/users/campaigns/`)
+        if (!res.ok) throw new Error("Failed to fetch campaigns")
+        const data = await res.json()
+        setCampaigns(data.campaigns || [])
+      } catch (err) {
+        console.error(err)
+        setError("Failed to load campaigns")
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    fetchCampaigns()
+  }, [])
 
   const handleCreateCampaign = () => {
     router.push("/create-campaign")
@@ -79,31 +66,46 @@ export default function CampaignHistoryPage() {
             </div>
           </CardHeader>
           <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Campaign</TableHead>
-                  <TableHead>Audience Size</TableHead>
-                  <TableHead>Sent</TableHead>
-                  <TableHead>Failed</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {campaignData.map((campaign) => (
-                  <TableRow key={campaign.id}>
-                    <TableCell>
-                      <div>
-                        <div className="font-medium">{campaign.name}</div>
-                        <div className="text-sm text-muted-foreground">{campaign.date}</div>
-                      </div>
-                    </TableCell>
-                    <TableCell>{campaign.audienceSize.toLocaleString()}</TableCell>
-                    <TableCell>{campaign.sent.toLocaleString()}</TableCell>
-                    <TableCell className="text-destructive">{campaign.failed}</TableCell>
+            {loading && <p className="text-sm text-muted-foreground">Loading campaigns...</p>}
+            {error && <p className="text-sm text-destructive">{error}</p>}
+
+            {!loading && !error && (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Campaign</TableHead>
+                    <TableHead>Audience Size</TableHead>
+                    <TableHead>Sent</TableHead>
+                    <TableHead>Failed</TableHead>
+                    <TableHead>Pending</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {campaigns.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={5} className="text-center text-sm text-muted-foreground">
+                        No campaigns found
+                      </TableCell>
+                    </TableRow>
+                  )}
+
+                  {campaigns.map((c) => (
+                    <TableRow key={c.id}>
+                      <TableCell>
+                        <div>
+                          <div className="font-medium">{c.name}</div>
+                          <div className="text-sm text-muted-foreground">{c.date}</div>
+                        </div>
+                      </TableCell>
+                      <TableCell>{c.audienceSize?.toLocaleString() ?? 0}</TableCell>
+                      <TableCell>{c.sent?.toLocaleString() ?? 0}</TableCell>
+                      <TableCell className="text-destructive">{c.failed ?? 0}</TableCell>
+                      <TableCell className="text-amber-600">{c.pending ?? 0}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
           </CardContent>
         </Card>
       </main>
