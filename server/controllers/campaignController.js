@@ -1,393 +1,112 @@
 import db from "../dbConnection.js";
-import nodemailer from 'nodemailer';
+// import nodemailer from 'nodemailer';
+import { transporter } from "../utils/emailservice.js";
+import { sendCampaignEmail } from "../utils/emailservice.js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-
+import { checkCircuitBreaker, recordAIFailure,recordAISuccess,retryWithBackoff } from "../utils/aiHelperFuntions.js";
+import { validateRules, buildCustomerQuery, getMatchingCustomers } from "../utils/helperFunctionRules.js";
+import { generateRulesFallback } from "../utils/prompthelper.js";
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Circuit breaker state for AI service
-let aiServiceState = {
-    failures: 0,
-    lastFailureTime: null,
-    isCircuitOpen: false,
-    circuitOpenTime: null
-};
 
-const CIRCUIT_BREAKER_THRESHOLD = 3; // failures
-const CIRCUIT_BREAKER_TIMEOUT = 60000; // 1 minute
-const MAX_CONSECUTIVE_FAILURES = 5;
-
-// Helper function to check and update circuit breaker
-const checkCircuitBreaker = () => {
-    const now = Date.now();
-    
-    // Reset circuit breaker after timeout
-    if (aiServiceState.isCircuitOpen && 
-        now - aiServiceState.circuitOpenTime > CIRCUIT_BREAKER_TIMEOUT) {
-        console.log('Circuit breaker reset - attempting AI service again');
-        aiServiceState.isCircuitOpen = false;
-        aiServiceState.failures = 0;
-    }
-    
-    return !aiServiceState.isCircuitOpen;
-};
-
-// Helper function to record AI service failure
-const recordAIFailure = () => {
-    aiServiceState.failures++;
-    aiServiceState.lastFailureTime = Date.now();
-    
-    if (aiServiceState.failures >= CIRCUIT_BREAKER_THRESHOLD) {
-        aiServiceState.isCircuitOpen = true;
-        aiServiceState.circuitOpenTime = Date.now();
-        console.log(`Circuit breaker opened after ${aiServiceState.failures} failures`);
-    }
-};
-
-// Helper function to record AI service success
-const recordAISuccess = () => {
-    aiServiceState.failures = 0;
-    aiServiceState.isCircuitOpen = false;
-    aiServiceState.lastFailureTime = null;
-};
-
-// Helper function to retry API calls with exponential backoff
-const retryWithBackoff = async (fn, maxRetries = 3, baseDelay = 1000) => {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            const result = await fn();
-            return result;
-        } catch (error) {
-            // Check if it's a retryable error
-            const isRetryable = error.status === 503 || 
-                               error.status === 429 || 
-                               error.status === 500 ||
-                               error.message?.includes('overloaded') ||
-                               error.message?.includes('rate limit') ||
-                               error.message?.includes('timeout') ||
-                               error.code === 'ECONNRESET' ||
-                               error.code === 'ETIMEDOUT' ||
-                               error.code === 'ENOTFOUND';
-
-            if (!isRetryable || attempt === maxRetries) {
-                throw error;
-            }
-
-            // Calculate delay with exponential backoff + jitter
-            const jitter = Math.random() * 500;
-            const delay = Math.min(baseDelay * Math.pow(2, attempt - 1) + jitter, 10000);
-            
-            console.log(`AI API attempt ${attempt} failed (${error.message}), retrying in ${Math.round(delay)}ms...`);
-            await new Promise(resolve => setTimeout(resolve, delay));
-        }
-    }
-};
-
-// Configure email transporter
-const transporter = nodemailer.createTransport({
-    service: "Gmail",
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: process.env.production == true,
-    auth: {
-        user: process.env.sender_email,
-        pass: process.env.sender_pass,
-    },
-});
-
-// Verify email configuration on startup
-if (process.env.SMTP_HOST) {
-    transporter.verify((error, success) => {
-        if (error) {
-            console.warn('Email configuration verification failed:', error.message);
-        } else {
-            console.log('Email server configuration verified successfully');
-        }
-    });
-}
-
-// Helper function to validate rules
-const validateRules = (rules) => {
-    if (!Array.isArray(rules) || rules.length === 0) {
-        return { valid: false, message: "Rules must be a non-empty array" };
-    }
-
-    const validFields = ['Total Spend', 'Total Visits', 'Last Visit Date'];
-    const validOperators = ['>', '<', '='];
-    const validLogicOperators = ['AND', 'OR'];
-
-    for (let i = 0; i < rules.length; i++) {
-        const rule = rules[i];
-        
-        // Check required properties
-        if (typeof rule !== 'object' || rule === null) {
-            return { valid: false, message: `Rule ${i + 1} must be an object` };
-        }
-
-        if (!validFields.includes(rule.field)) {
-            return { valid: false, message: `Rule ${i + 1}: Invalid field "${rule.field}". Must be one of: ${validFields.join(', ')}` };
-        }
-        
-        if (!validOperators.includes(rule.operator)) {
-            return { valid: false, message: `Rule ${i + 1}: Invalid operator "${rule.operator}". Must be one of: ${validOperators.join(', ')}` };
-        }
-        
-        if (!rule.value || rule.value.toString().trim() === '') {
-            return { valid: false, message: `Rule ${i + 1}: Value is required for field "${rule.field}"` };
-        }
-        
-        // Validate value based on field type
-        if (rule.field === 'Total Spend' || rule.field === 'Total Visits') {
-            const numValue = parseFloat(rule.value.toString().replace(/[₹$,]/g, ''));
-            if (isNaN(numValue) || numValue < 0) {
-                return { valid: false, message: `Rule ${i + 1}: ${rule.field} must be a valid positive number` };
-            }
-        }
-        
-        if (rule.field === 'Last Visit Date') {
-            const dateValue = new Date(rule.value);
-            if (isNaN(dateValue.getTime())) {
-                return { valid: false, message: `Rule ${i + 1}: Last Visit Date must be a valid date in YYYY-MM-DD format` };
-            }
-        }
-        
-        // Check logic operator (not needed for last rule)
-        if (i < rules.length - 1 && rule.logic && !validLogicOperators.includes(rule.logic)) {
-            return { valid: false, message: `Rule ${i + 1}: Invalid logic operator "${rule.logic}". Must be "AND" or "OR"` };
-        }
-    }
-    
-    return { valid: true };
-};
-
-// Helper function to build SQL query from rules
-const buildCustomerQuery = (rules, countOnly = false) => {
-    if (!rules || rules.length === 0) {
-        throw new Error('Rules cannot be empty');
-    }
-
-    let baseQuery = countOnly 
-        ? 'SELECT COUNT(*) as count FROM customers WHERE '
-        : 'SELECT * FROM customers WHERE ';
-    
-    let conditions = [];
-    let params = [];
-    let paramCount = 1;
-    
-    rules.forEach((rule, index) => {
-        let condition = '';
-        let fieldName = '';
-        
-        // Map frontend field names to database column names
-        switch (rule.field) {
-            case 'Total Spend':
-                fieldName = 'total_spend';
-                break;
-            case 'Total Visits':
-                fieldName = 'total_visits';
-                break;
-            case 'Last Visit Date':
-                fieldName = 'last_visit';
-                break;
-            default:
-                throw new Error(`Unknown field: ${rule.field}`);
-        }
-        
-        // Build condition based on operator
-        switch (rule.operator) {
-            case '>':
-                condition = `${fieldName} > $${paramCount}`;
-                break;
-            case '<':
-                condition = `${fieldName} < $${paramCount}`;
-                break;
-            case '=':
-                condition = `${fieldName} = $${paramCount}`;
-                break;
-            default:
-                throw new Error(`Unknown operator: ${rule.operator}`);
-        }
-        
-        // Convert value based on field type
-        let paramValue = rule.value;
-        if (rule.field === 'Total Spend' || rule.field === 'Total Visits') {
-            paramValue = parseFloat(rule.value.toString().replace(/[₹$,]/g, ''));
-        } else if (rule.field === 'Last Visit Date') {
-            paramValue = rule.value;
-        }
-        
-        conditions.push(condition);
-        params.push(paramValue);
-        paramCount++;
-        
-        // Add logic operator if not the last rule and logic is specified
-        if (index < rules.length - 1 && rule.logic) {
-            conditions[conditions.length - 1] += ` ${rule.logic} `;
-        }
-    });
-    
-    const query = baseQuery + conditions.join(' ');
-    return { query, params };
-};
-
-// Helper function to get customers matching the rules
-const getMatchingCustomers = async (rules) => {
-    try {
-        // Validate rules first
-        const validation = validateRules(rules);
-        if (!validation.valid) {
-            throw new Error(validation.message);
-        }
-        
-        // Build and execute query
-        const { query, params } = buildCustomerQuery(rules);
-        console.log('Executing query:', query, 'with params:', params);
-        
-        const result = await db.query(query, params);
-        
-        return {
-            success: true,
-            customers: result.rows,
-            count: result.rows.length
-        };
-    } catch (error) {
-        console.error('Error getting matching customers:', error);
-        return {
-            success: false,
-            error: error.message,
-            customers: [],
-            count: 0
-        };
-    }
-};
-
-// Helper function to send email with retry logic
-const sendCampaignEmail = async (customer, messageTemplate, campaignName, retries = 2) => {
-    for (let attempt = 1; attempt <= retries + 1; attempt++) {
-        try {
-            const mailOptions = {
-                from: process.env.sender_email || 'noreply@yourcompany.com',
-                to: customer.email,
-                subject: campaignName,
-                text: messageTemplate,
-                html: `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                    <h2 style="color: #333;">${campaignName}</h2>
-                    <p style="line-height: 1.6; color: #666;">${messageTemplate.replace(/\n/g, '<br>')}</p>
-                </div>`
-            };
-            
-            const info = await transporter.sendMail(mailOptions);
-            console.log(`Email sent to ${customer.email}: ${info.messageId}`);
-            return { success: true, messageId: info.messageId };
-        } catch (error) {
-            console.error(`Email attempt ${attempt} failed for ${customer.email}:`, error.message);
-            
-            if (attempt === retries + 1) {
-                return { success: false, error: error.message };
-            }
-            
-            // Wait before retry
-            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-        }
-    }
-};
 
 // Enhanced fallback rule generation with better pattern matching
-const generateRulesFallback = (prompt) => {
-    console.log('Using fallback pattern matching for prompt:', prompt);
-    const rules = [];
-    const lowerPrompt = prompt.toLowerCase();
+// const generateRulesFallback = (prompt) => {
+//     console.log('Using fallback pattern matching for prompt:', prompt);
+//     const rules = [];
+//     const lowerPrompt = prompt.toLowerCase();
     
-    // Pattern matching for spend with various formats
-    const spendPatterns = [
-        /(?:spent?|spend|spending|purchase[ds]?).*?(?:over|above|more than|greater than|\>)\s*[₹$]?(\d+(?:,\d+)*(?:\.\d+)?)/i,
-        /(?:spent?|spend|spending|purchase[ds]?).*?(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:rupees?|dollars?|₹|\$)/i,
-        /[₹$]\s*(\d+(?:,\d+)*(?:\.\d+)?).*?(?:or more|and above|\+)/i,
-        /(\d+(?:,\d+)*(?:\.\d+)?)\s*[₹$].*?(?:or more|and above)/i
-    ];
+//     // Pattern matching for spend with various formats
+//     const spendPatterns = [
+//         /(?:spent?|spend|spending|purchase[ds]?).*?(?:over|above|more than|greater than|\>)\s*[₹$]?(\d+(?:,\d+)*(?:\.\d+)?)/i,
+//         /(?:spent?|spend|spending|purchase[ds]?).*?(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:rupees?|dollars?|₹|\$)/i,
+//         /[₹$]\s*(\d+(?:,\d+)*(?:\.\d+)?).*?(?:or more|and above|\+)/i,
+//         /(\d+(?:,\d+)*(?:\.\d+)?)\s*[₹$].*?(?:or more|and above)/i
+//     ];
     
-    for (const pattern of spendPatterns) {
-        const match = lowerPrompt.match(pattern);
-        if (match) {
-            const value = parseFloat(match[1].replace(/,/g, ''));
-            if (!isNaN(value) && value > 0) {
-                rules.push({
-                    field: "Total Spend",
-                    operator: ">",
-                    value: value.toString(),
-                    logic: "AND"
-                });
-                break;
-            }
-        }
-    }
+//     for (const pattern of spendPatterns) {
+//         const match = lowerPrompt.match(pattern);
+//         if (match) {
+//             const value = parseFloat(match[1].replace(/,/g, ''));
+//             if (!isNaN(value) && value > 0) {
+//                 rules.push({
+//                     field: "Total Spend",
+//                     operator: ">",
+//                     value: value.toString(),
+//                     logic: "AND"
+//                 });
+//                 break;
+//             }
+//         }
+//     }
     
-    // Pattern matching for visits
-    const visitPatterns = [
-        /(?:visited?|visits?|came).*?(?:more than|over|above|\>)\s*(\d+)/i,
-        /(?:visited?|visits?|came).*?(\d+)\s*(?:times?|visits?)/i,
-        /(\d+)\s*(?:or more|\+)\s*(?:visits?|times?)/i
-    ];
+//     // Pattern matching for visits
+//     const visitPatterns = [
+//         /(?:visited?|visits?|came).*?(?:more than|over|above|\>)\s*(\d+)/i,
+//         /(?:visited?|visits?|came).*?(\d+)\s*(?:times?|visits?)/i,
+//         /(\d+)\s*(?:or more|\+)\s*(?:visits?|times?)/i
+//     ];
     
-    for (const pattern of visitPatterns) {
-        const match = lowerPrompt.match(pattern);
-        if (match) {
-            const value = parseInt(match[1]);
-            if (!isNaN(value) && value >= 0) {
-                rules.push({
-                    field: "Total Visits",
-                    operator: ">",
-                    value: value.toString(),
-                    logic: "AND"
-                });
-                break;
-            }
-        }
-    }
+//     for (const pattern of visitPatterns) {
+//         const match = lowerPrompt.match(pattern);
+//         if (match) {
+//             const value = parseInt(match[1]);
+//             if (!isNaN(value) && value >= 0) {
+//                 rules.push({
+//                     field: "Total Visits",
+//                     operator: ">",
+//                     value: value.toString(),
+//                     logic: "AND"
+//                 });
+//                 break;
+//             }
+//         }
+//     }
     
-    // Pattern matching for date-based criteria
-    const datePatterns = [
-        /(?:haven't visited?|not visited?|inactive|dormant).*?(?:in|for|since).*?(\d+)\s*(months?|days?|weeks?|years?)/i,
-        /(?:last visit|visited last).*?(?:over|more than).*?(\d+)\s*(months?|days?|weeks?|years?)/i,
-        /(\d+)\s*(months?|days?|weeks?|years?).*?(?:ago|back)/i
-    ];
+//     // Pattern matching for date-based criteria
+//     const datePatterns = [
+//         /(?:haven't visited?|not visited?|inactive|dormant).*?(?:in|for|since).*?(\d+)\s*(months?|days?|weeks?|years?)/i,
+//         /(?:last visit|visited last).*?(?:over|more than).*?(\d+)\s*(months?|days?|weeks?|years?)/i,
+//         /(\d+)\s*(months?|days?|weeks?|years?).*?(?:ago|back)/i
+//     ];
     
-    for (const pattern of datePatterns) {
-        const match = lowerPrompt.match(pattern);
-        if (match) {
-            const timeValue = parseInt(match[1]);
-            const timeUnit = match[2].toLowerCase();
+//     for (const pattern of datePatterns) {
+//         const match = lowerPrompt.match(pattern);
+//         if (match) {
+//             const timeValue = parseInt(match[1]);
+//             const timeUnit = match[2].toLowerCase();
             
-            if (!isNaN(timeValue) && timeValue > 0) {
-                const date = new Date();
-                if (timeUnit.startsWith('month')) {
-                    date.setMonth(date.getMonth() - timeValue);
-                } else if (timeUnit.startsWith('week')) {
-                    date.setDate(date.getDate() - (timeValue * 7));
-                } else if (timeUnit.startsWith('year')) {
-                    date.setFullYear(date.getFullYear() - timeValue);
-                } else {
-                    date.setDate(date.getDate() - timeValue);
-                }
+//             if (!isNaN(timeValue) && timeValue > 0) {
+//                 const date = new Date();
+//                 if (timeUnit.startsWith('month')) {
+//                     date.setMonth(date.getMonth() - timeValue);
+//                 } else if (timeUnit.startsWith('week')) {
+//                     date.setDate(date.getDate() - (timeValue * 7));
+//                 } else if (timeUnit.startsWith('year')) {
+//                     date.setFullYear(date.getFullYear() - timeValue);
+//                 } else {
+//                     date.setDate(date.getDate() - timeValue);
+//                 }
                 
-                rules.push({
-                    field: "Last Visit Date",
-                    operator: "<",
-                    value: date.toISOString().split('T')[0],
-                    logic: "AND"
-                });
-                break;
-            }
-        }
-    }
+//                 rules.push({
+//                     field: "Last Visit Date",
+//                     operator: "<",
+//                     value: date.toISOString().split('T')[0],
+//                     logic: "AND"
+//                 });
+//                 break;
+//             }
+//         }
+//     }
     
-    // Set the last rule's logic to null
-    if (rules.length > 0) {
-        rules[rules.length - 1].logic = null;
-    }
+//     // Set the last rule's logic to null
+//     if (rules.length > 0) {
+//         rules[rules.length - 1].logic = null;
+//     }
     
-    console.log('Generated fallback rules:', rules);
-    return rules;
-};
+//     console.log('Generated fallback rules:', rules);
+//     return rules;
+// };
 
 // Get campaigns with enhanced error handling and pagination
 export const getCampaign = async (req, res) => {
