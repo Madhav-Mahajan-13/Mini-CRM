@@ -5,7 +5,7 @@ import cors from "cors";
 import jwt from "jsonwebtoken";
 import session from "express-session";
 import "./auth.js";
-import router from './routes/userRoutes.js';
+import router from './routes/campaignRoutes.js';
 import { authenticateUser } from './middleware/authMiddleware.js'; // Add this
 
 const app = express();

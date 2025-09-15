@@ -6,7 +6,8 @@ import {
   IconButton, Alert, Avatar
 } from "@mui/material";
 import {
-  Add as AddIcon, Delete as DeleteIcon, Person as PersonIcon, Info as InfoIcon
+  Add as AddIcon, Delete as DeleteIcon, Person as PersonIcon, Info as InfoIcon,
+  AutoFixHigh as AutoFixHighIcon
 } from "@mui/icons-material";
 import { useAuth, authFetch } from "../utils/auth";
 
@@ -21,6 +22,12 @@ export default function CreateCampaignPage() {
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errors, setErrors] = useState({});
+
+  // State for the natural language prompt feature
+  const [prompt, setPrompt] = useState("");
+  const [isGeneratingRules, setIsGeneratingRules] = useState(false);
+  const [generationError, setGenerationError] = useState("");
+
 
   useEffect(() => {
     if (!isLoading && !isAuthenticated) {
@@ -130,6 +137,49 @@ export default function CreateCampaignPage() {
       setIsSubmitting(false);
     }
   };
+  
+  // Handles both rule generation from prompt and audience preview in one API call
+   const handleGenerateAndPreview = async () => {
+    if (!prompt.trim()) return;
+
+    setIsGeneratingRules(true);
+    setGenerationError("");
+    setAudienceSize(null); // Clear previous preview
+    try {
+      // This endpoint returns both the parsed rules and the audience count
+      const response = await authFetch('/api/users/preview-from-prompt', {
+        method: 'POST',
+        body: JSON.stringify({ prompt }),
+      });
+
+      if (response.ok) {
+        const data = await response.json(); // Expects { rules: [...], count: 123 }
+        if (Array.isArray(data.rules) && data.rules.length > 0) {
+            setRules(data.rules);
+            setAudienceSize(data.count);
+            
+            // Show info if fallback was used
+            if (data.fallbackUsed) {
+              setGenerationError("AI service is temporarily busy. Used pattern matching instead - please verify the generated rules.");
+            }
+        } else {
+            setGenerationError("Could not generate valid rules from the prompt. Please try rephrasing.");
+        }
+      } else {
+        const errorData = await response.json();
+        if (errorData.fallbackUsed) {
+          setGenerationError("AI service is temporarily unavailable. Please try again later or use the manual rule builder below.");
+        } else {
+          setGenerationError(errorData.message || "Failed to parse prompt.");
+        }
+      }
+    } catch (error) {
+      console.error('Error generating rules:', error);
+      setGenerationError("Service temporarily unavailable. Please try again in a few moments or use the manual rule builder.");
+    } finally {
+      setIsGeneratingRules(false);
+    }
+  };
 
   if (isLoading || !isAuthenticated) {
     return (
@@ -180,6 +230,30 @@ export default function CreateCampaignPage() {
                 </Button>
               </Box>
               
+              {/* Natural Language Input Section */}
+              <Box sx={{ border: '1px solid #e0e0e0', borderRadius: '4px', p: 2, my: 2 }}>
+                <Typography variant="subtitle1" gutterBottom>
+                  Describe Audience for a Quick Preview
+                </Typography>
+                <TextField
+                  fullWidth
+                  label="e.g., Customers who spent over ₹5000 and haven't visited in 3 months"
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  disabled={isGeneratingRules}
+                />
+                <Button
+                  onClick={handleGenerateAndPreview}
+                  variant="contained"
+                  startIcon={isGeneratingRules ? <CircularProgress size={20} color="inherit" /> : <AutoFixHighIcon />}
+                  disabled={isGeneratingRules || !prompt}
+                  sx={{ mt: 1 }}
+                >
+                  Generate Rules & Preview Audience
+                </Button>
+                {generationError && <Alert severity="error" sx={{ mt: 2 }}>{generationError}</Alert>}
+              </Box>
+
               {errors.rules && <Alert severity="error">{errors.rules}</Alert>}
 
               {rules.map((rule, index) => (

@@ -1,80 +1,116 @@
 import db from "../dbConnection.js";
-import nodemailer from 'nodemailer'; // For sending emails
-// get campaign
+import nodemailer from 'nodemailer';
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-export const getCampaign = async (req, res) => {
-    try {
-        const query = `
-            SELECT 
-                c.id,
-                c.name,
-                c.message_template,
-                c.rules_json,
-                c.total_recipients,
-                c.emails_sent,
-                c.emails_failed,
-                c.status AS campaign_status,
-                u.name AS created_by_name,
-                u.email AS created_by_email,
-                c.created_at
-            FROM campaigns c
-            JOIN users u ON c.created_by = u.id
-            ORDER BY c.created_at DESC
-        `;
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-        const result = await db.query(query);
+// Circuit breaker state for AI service
+let aiServiceState = {
+    failures: 0,
+    lastFailureTime: null,
+    isCircuitOpen: false,
+    circuitOpenTime: null
+};
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: "No campaigns found" });
-        }
+const CIRCUIT_BREAKER_THRESHOLD = 3; // failures
+const CIRCUIT_BREAKER_TIMEOUT = 60000; // 1 minute
+const MAX_CONSECUTIVE_FAILURES = 5;
 
-        const campaigns = result.rows.map(c => ({
-            id: c.id,
-            name: c.name,
-            date: c.created_at ? new Date(c.created_at).toISOString().split('T')[0] : null,
-            audienceSize: Number(c.total_recipients) || 0,
-            sent: Number(c.emails_sent) || 0,
-            failed: Number(c.emails_failed) || 0,
-            pending: Math.max((Number(c.total_recipients) || 0) 
-                               - (Number(c.emails_sent) || 0) 
-                               - (Number(c.emails_failed) || 0), 0),
-            messageTemplate: c.message_template,
-            rules: typeof c.rules_json === 'string' ? JSON.parse(c.rules_json) : c.rules_json,
-            createdBy: {
-                name: c.created_by_name,
-                email: c.created_by_email
-            },
-            status: c.campaign_status,
-            createdAt: c.created_at
-        }));
+// Helper function to check and update circuit breaker
+const checkCircuitBreaker = () => {
+    const now = Date.now();
+    
+    // Reset circuit breaker after timeout
+    if (aiServiceState.isCircuitOpen && 
+        now - aiServiceState.circuitOpenTime > CIRCUIT_BREAKER_TIMEOUT) {
+        console.log('Circuit breaker reset - attempting AI service again');
+        aiServiceState.isCircuitOpen = false;
+        aiServiceState.failures = 0;
+    }
+    
+    return !aiServiceState.isCircuitOpen;
+};
 
-        res.status(200).json({
-            campaigns,
-            total: campaigns.length
-        });
-
-    } catch (error) {
-        console.error("Error fetching campaigns:", error);
-        res.status(500).json({ message: "Server error while fetching campaigns" });
+// Helper function to record AI service failure
+const recordAIFailure = () => {
+    aiServiceState.failures++;
+    aiServiceState.lastFailureTime = Date.now();
+    
+    if (aiServiceState.failures >= CIRCUIT_BREAKER_THRESHOLD) {
+        aiServiceState.isCircuitOpen = true;
+        aiServiceState.circuitOpenTime = Date.now();
+        console.log(`Circuit breaker opened after ${aiServiceState.failures} failures`);
     }
 };
 
+// Helper function to record AI service success
+const recordAISuccess = () => {
+    aiServiceState.failures = 0;
+    aiServiceState.isCircuitOpen = false;
+    aiServiceState.lastFailureTime = null;
+};
 
+// Helper function to retry API calls with exponential backoff
+const retryWithBackoff = async (fn, maxRetries = 3, baseDelay = 1000) => {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const result = await fn();
+            return result;
+        } catch (error) {
+            // Check if it's a retryable error
+            const isRetryable = error.status === 503 || 
+                               error.status === 429 || 
+                               error.status === 500 ||
+                               error.message?.includes('overloaded') ||
+                               error.message?.includes('rate limit') ||
+                               error.message?.includes('timeout') ||
+                               error.code === 'ECONNRESET' ||
+                               error.code === 'ETIMEDOUT' ||
+                               error.code === 'ENOTFOUND';
 
+            if (!isRetryable || attempt === maxRetries) {
+                throw error;
+            }
 
-// Configure email transporter (adjust based on your email service)
+            // Calculate delay with exponential backoff + jitter
+            const jitter = Math.random() * 500;
+            const delay = Math.min(baseDelay * Math.pow(2, attempt - 1) + jitter, 10000);
+            
+            console.log(`AI API attempt ${attempt} failed (${error.message}), retrying in ${Math.round(delay)}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+};
+
+// Configure email transporter
 const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    secure: false,
+    service: "Gmail",
+    host: "smtp.gmail.com",
+    port: 465,
+    secure: process.env.production == true,
     auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
+        user: process.env.sender_email,
+        pass: process.env.sender_pass,
     },
 });
 
+// Verify email configuration on startup
+if (process.env.SMTP_HOST) {
+    transporter.verify((error, success) => {
+        if (error) {
+            console.warn('Email configuration verification failed:', error.message);
+        } else {
+            console.log('Email server configuration verified successfully');
+        }
+    });
+}
+
 // Helper function to validate rules
 const validateRules = (rules) => {
+    if (!Array.isArray(rules) || rules.length === 0) {
+        return { valid: false, message: "Rules must be a non-empty array" };
+    }
+
     const validFields = ['Total Spend', 'Total Visits', 'Last Visit Date'];
     const validOperators = ['>', '<', '='];
     const validLogicOperators = ['AND', 'OR'];
@@ -82,39 +118,41 @@ const validateRules = (rules) => {
     for (let i = 0; i < rules.length; i++) {
         const rule = rules[i];
         
-        // Check if field is valid
+        // Check required properties
+        if (typeof rule !== 'object' || rule === null) {
+            return { valid: false, message: `Rule ${i + 1} must be an object` };
+        }
+
         if (!validFields.includes(rule.field)) {
-            return { valid: false, message: `Invalid field: ${rule.field}` };
+            return { valid: false, message: `Rule ${i + 1}: Invalid field "${rule.field}". Must be one of: ${validFields.join(', ')}` };
         }
         
-        // Check if operator is valid
         if (!validOperators.includes(rule.operator)) {
-            return { valid: false, message: `Invalid operator: ${rule.operator}` };
+            return { valid: false, message: `Rule ${i + 1}: Invalid operator "${rule.operator}". Must be one of: ${validOperators.join(', ')}` };
         }
         
-        // Check if value exists and is meaningful
-        if (!rule.value || rule.value.trim() === '') {
-            return { valid: false, message: `Value is required for field: ${rule.field}` };
+        if (!rule.value || rule.value.toString().trim() === '') {
+            return { valid: false, message: `Rule ${i + 1}: Value is required for field "${rule.field}"` };
         }
         
         // Validate value based on field type
         if (rule.field === 'Total Spend' || rule.field === 'Total Visits') {
-            const numValue = parseFloat(rule.value);
+            const numValue = parseFloat(rule.value.toString().replace(/[₹$,]/g, ''));
             if (isNaN(numValue) || numValue < 0) {
-                return { valid: false, message: `${rule.field} must be a valid positive number` };
+                return { valid: false, message: `Rule ${i + 1}: ${rule.field} must be a valid positive number` };
             }
         }
         
         if (rule.field === 'Last Visit Date') {
             const dateValue = new Date(rule.value);
             if (isNaN(dateValue.getTime())) {
-                return { valid: false, message: `Last Visit Date must be a valid date` };
+                return { valid: false, message: `Rule ${i + 1}: Last Visit Date must be a valid date in YYYY-MM-DD format` };
             }
         }
         
         // Check logic operator (not needed for last rule)
         if (i < rules.length - 1 && rule.logic && !validLogicOperators.includes(rule.logic)) {
-            return { valid: false, message: `Invalid logic operator: ${rule.logic}` };
+            return { valid: false, message: `Rule ${i + 1}: Invalid logic operator "${rule.logic}". Must be "AND" or "OR"` };
         }
     }
     
@@ -123,6 +161,10 @@ const validateRules = (rules) => {
 
 // Helper function to build SQL query from rules
 const buildCustomerQuery = (rules, countOnly = false) => {
+    if (!rules || rules.length === 0) {
+        throw new Error('Rules cannot be empty');
+    }
+
     let baseQuery = countOnly 
         ? 'SELECT COUNT(*) as count FROM customers WHERE '
         : 'SELECT * FROM customers WHERE ';
@@ -168,17 +210,16 @@ const buildCustomerQuery = (rules, countOnly = false) => {
         // Convert value based on field type
         let paramValue = rule.value;
         if (rule.field === 'Total Spend' || rule.field === 'Total Visits') {
-            paramValue = parseFloat(rule.value);
+            paramValue = parseFloat(rule.value.toString().replace(/[₹$,]/g, ''));
         } else if (rule.field === 'Last Visit Date') {
-            // For DATE fields, ensure proper format
-            paramValue = rule.value; // PostgreSQL will handle date conversion
+            paramValue = rule.value;
         }
         
         conditions.push(condition);
         params.push(paramValue);
         paramCount++;
         
-        // Add logic operator if not the last rule
+        // Add logic operator if not the last rule and logic is specified
         if (index < rules.length - 1 && rule.logic) {
             conditions[conditions.length - 1] += ` ${rule.logic} `;
         }
@@ -189,7 +230,7 @@ const buildCustomerQuery = (rules, countOnly = false) => {
 };
 
 // Helper function to get customers matching the rules
-const return_customers = async (rules) => {
+const getMatchingCustomers = async (rules) => {
     try {
         // Validate rules first
         const validation = validateRules(rules);
@@ -199,6 +240,8 @@ const return_customers = async (rules) => {
         
         // Build and execute query
         const { query, params } = buildCustomerQuery(rules);
+        console.log('Executing query:', query, 'with params:', params);
+        
         const result = await db.query(query, params);
         
         return {
@@ -207,6 +250,7 @@ const return_customers = async (rules) => {
             count: result.rows.length
         };
     } catch (error) {
+        console.error('Error getting matching customers:', error);
         return {
             success: false,
             error: error.message,
@@ -216,32 +260,228 @@ const return_customers = async (rules) => {
     }
 };
 
-// Helper function to send email
-const sendCampaignEmail = async (customer, messageTemplate, campaignName) => {
-    try {
-        const mailOptions = {
-            from: process.env.FROM_EMAIL || 'noreply@yourcompany.com',
-            to: customer.email,
-            subject: campaignName,
-            text: messageTemplate,
-            html: `<p>${messageTemplate.replace(/\n/g, '<br>')}</p>`
-        };
-        
-        await transporter.sendMail(mailOptions);
-        return { success: true };
-    } catch (error) {
-        console.error(`Failed to send email to ${customer.email}:`, error);
-        return { success: false, error: error.message };
+// Helper function to send email with retry logic
+const sendCampaignEmail = async (customer, messageTemplate, campaignName, retries = 2) => {
+    for (let attempt = 1; attempt <= retries + 1; attempt++) {
+        try {
+            const mailOptions = {
+                from: process.env.sender_email || 'noreply@yourcompany.com',
+                to: customer.email,
+                subject: campaignName,
+                text: messageTemplate,
+                html: `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                    <h2 style="color: #333;">${campaignName}</h2>
+                    <p style="line-height: 1.6; color: #666;">${messageTemplate.replace(/\n/g, '<br>')}</p>
+                </div>`
+            };
+            
+            const info = await transporter.sendMail(mailOptions);
+            console.log(`Email sent to ${customer.email}: ${info.messageId}`);
+            return { success: true, messageId: info.messageId };
+        } catch (error) {
+            console.error(`Email attempt ${attempt} failed for ${customer.email}:`, error.message);
+            
+            if (attempt === retries + 1) {
+                return { success: false, error: error.message };
+            }
+            
+            // Wait before retry
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        }
     }
 };
 
-// Preview audience function
+// Enhanced fallback rule generation with better pattern matching
+const generateRulesFallback = (prompt) => {
+    console.log('Using fallback pattern matching for prompt:', prompt);
+    const rules = [];
+    const lowerPrompt = prompt.toLowerCase();
+    
+    // Pattern matching for spend with various formats
+    const spendPatterns = [
+        /(?:spent?|spend|spending|purchase[ds]?).*?(?:over|above|more than|greater than|\>)\s*[₹$]?(\d+(?:,\d+)*(?:\.\d+)?)/i,
+        /(?:spent?|spend|spending|purchase[ds]?).*?(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:rupees?|dollars?|₹|\$)/i,
+        /[₹$]\s*(\d+(?:,\d+)*(?:\.\d+)?).*?(?:or more|and above|\+)/i,
+        /(\d+(?:,\d+)*(?:\.\d+)?)\s*[₹$].*?(?:or more|and above)/i
+    ];
+    
+    for (const pattern of spendPatterns) {
+        const match = lowerPrompt.match(pattern);
+        if (match) {
+            const value = parseFloat(match[1].replace(/,/g, ''));
+            if (!isNaN(value) && value > 0) {
+                rules.push({
+                    field: "Total Spend",
+                    operator: ">",
+                    value: value.toString(),
+                    logic: "AND"
+                });
+                break;
+            }
+        }
+    }
+    
+    // Pattern matching for visits
+    const visitPatterns = [
+        /(?:visited?|visits?|came).*?(?:more than|over|above|\>)\s*(\d+)/i,
+        /(?:visited?|visits?|came).*?(\d+)\s*(?:times?|visits?)/i,
+        /(\d+)\s*(?:or more|\+)\s*(?:visits?|times?)/i
+    ];
+    
+    for (const pattern of visitPatterns) {
+        const match = lowerPrompt.match(pattern);
+        if (match) {
+            const value = parseInt(match[1]);
+            if (!isNaN(value) && value >= 0) {
+                rules.push({
+                    field: "Total Visits",
+                    operator: ">",
+                    value: value.toString(),
+                    logic: "AND"
+                });
+                break;
+            }
+        }
+    }
+    
+    // Pattern matching for date-based criteria
+    const datePatterns = [
+        /(?:haven't visited?|not visited?|inactive|dormant).*?(?:in|for|since).*?(\d+)\s*(months?|days?|weeks?|years?)/i,
+        /(?:last visit|visited last).*?(?:over|more than).*?(\d+)\s*(months?|days?|weeks?|years?)/i,
+        /(\d+)\s*(months?|days?|weeks?|years?).*?(?:ago|back)/i
+    ];
+    
+    for (const pattern of datePatterns) {
+        const match = lowerPrompt.match(pattern);
+        if (match) {
+            const timeValue = parseInt(match[1]);
+            const timeUnit = match[2].toLowerCase();
+            
+            if (!isNaN(timeValue) && timeValue > 0) {
+                const date = new Date();
+                if (timeUnit.startsWith('month')) {
+                    date.setMonth(date.getMonth() - timeValue);
+                } else if (timeUnit.startsWith('week')) {
+                    date.setDate(date.getDate() - (timeValue * 7));
+                } else if (timeUnit.startsWith('year')) {
+                    date.setFullYear(date.getFullYear() - timeValue);
+                } else {
+                    date.setDate(date.getDate() - timeValue);
+                }
+                
+                rules.push({
+                    field: "Last Visit Date",
+                    operator: "<",
+                    value: date.toISOString().split('T')[0],
+                    logic: "AND"
+                });
+                break;
+            }
+        }
+    }
+    
+    // Set the last rule's logic to null
+    if (rules.length > 0) {
+        rules[rules.length - 1].logic = null;
+    }
+    
+    console.log('Generated fallback rules:', rules);
+    return rules;
+};
+
+// Get campaigns with enhanced error handling and pagination
+export const getCampaign = async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const offset = (page - 1) * limit;
+
+        const query = `
+            SELECT 
+                c.id,
+                c.name,
+                c.message_template,
+                c.rules_json,
+                c.total_recipients,
+                c.emails_sent,
+                c.emails_failed,
+                c.status AS campaign_status,
+                u.name AS created_by_name,
+                u.email AS created_by_email,
+                c.created_at
+            FROM campaigns c
+            JOIN users u ON c.created_by = u.id
+            ORDER BY c.created_at DESC
+            LIMIT $1 OFFSET $2
+        `;
+
+        const countQuery = 'SELECT COUNT(*) as total FROM campaigns';
+        
+        const [result, countResult] = await Promise.all([
+            db.query(query, [limit, offset]),
+            db.query(countQuery)
+        ]);
+
+        const totalCampaigns = parseInt(countResult.rows[0].total);
+        const totalPages = Math.ceil(totalCampaigns / limit);
+
+        if (result.rows.length === 0 && page === 1) {
+            return res.status(200).json({ 
+                campaigns: [], 
+                total: 0,
+                page: 1,
+                totalPages: 0,
+                message: "No campaigns found"
+            });
+        }
+
+        const campaigns = result.rows.map(c => ({
+            id: c.id,
+            name: c.name,
+            date: c.created_at ? new Date(c.created_at).toLocaleDateString('en-IN') : null,
+            audienceSize: Number(c.total_recipients) || 0,
+            sent: Number(c.emails_sent) || 0,
+            failed: Number(c.emails_failed) || 0,
+            pending: Math.max((Number(c.total_recipients) || 0) 
+                               - (Number(c.emails_sent) || 0) 
+                               - (Number(c.emails_failed) || 0), 0),
+            messageTemplate: c.message_template,
+            rules: typeof c.rules_json === 'string' ? JSON.parse(c.rules_json) : c.rules_json,
+            createdBy: {
+                name: c.created_by_name,
+                email: c.created_by_email
+            },
+            status: c.campaign_status || 'completed',
+            createdAt: c.created_at
+        }));
+
+        res.status(200).json({
+            campaigns,
+            total: totalCampaigns,
+            page,
+            totalPages,
+            hasMore: page < totalPages
+        });
+
+    } catch (error) {
+        console.error("Error fetching campaigns:", error);
+        res.status(500).json({ 
+            message: "Server error while fetching campaigns",
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+};
+
+// Preview audience function with enhanced validation
 export const previewaudience = async (req, res) => {
     try {
         const { rules } = req.body;
         
         if (!rules || !Array.isArray(rules) || rules.length === 0) {
-            return res.status(400).json({ message: "Rules are required and must be a non-empty array" });
+            return res.status(400).json({ 
+                message: "Rules are required and must be a non-empty array",
+                example: [{"field": "Total Spend", "operator": ">", "value": "1000", "logic": null}]
+            });
         }
         
         // Validate rules
@@ -258,28 +498,35 @@ export const previewaudience = async (req, res) => {
         
         res.status(200).json({ 
             count,
-            message: `${count} customers match the specified criteria`
+            message: `${count.toLocaleString('en-IN')} customers match the specified criteria`,
+            rules: rules // Echo back the rules for confirmation
         });
         
     } catch (error) {
         console.error("Error in preview audience:", error);
-        res.status(500).json({ message: "Server error while previewing audience" });
+        res.status(500).json({ 
+            message: "Server error while previewing audience",
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
     }
 };
 
-// Create campaign function
+// Create campaign function with comprehensive error handling
 export const createCampaign = async (req, res) => {
     const { name, message_template, rules_json } = req.body;
-    // const userId = 1; // assuming user ID is available in req.user
-    const userId = req.user.id; // assuming user ID is available in req.user
+    const userId = req.user.id;
 
     try {
         // Input validation
-        if (!name || !message_template || !rules_json) {
-            return res.status(400).json({ message: "Name, message template, and rules are required" });
+        if (!name || name.trim().length < 3) {
+            return res.status(400).json({ message: "Campaign name must be at least 3 characters long" });
         }
         
-        if (!Array.isArray(rules_json) || rules_json.length === 0) {
+        if (!message_template || message_template.trim().length < 10) {
+            return res.status(400).json({ message: "Campaign message must be at least 10 characters long" });
+        }
+        
+        if (!rules_json || !Array.isArray(rules_json) || rules_json.length === 0) {
             return res.status(400).json({ message: "Rules must be a non-empty array" });
         }
         
@@ -289,8 +536,8 @@ export const createCampaign = async (req, res) => {
             return res.status(404).json({ message: "User not found" });
         }
 
-        // Step 1: Validate rules and get matching customers
-        const customerResult = await return_customers(rules_json);
+        // Validate rules and get matching customers
+        const customerResult = await getMatchingCustomers(rules_json);
         if (!customerResult.success) {
             return res.status(400).json({ message: customerResult.error });
         }
@@ -298,109 +545,301 @@ export const createCampaign = async (req, res) => {
         const { customers } = customerResult;
         
         if (customers.length === 0) {
-            return res.status(400).json({ message: "No customers match the specified criteria" });
+            return res.status(400).json({ 
+                message: "No customers match the specified criteria. Please adjust your rules and try again." 
+            });
+        }
+
+        // Check if too many customers (optional limit)
+        const MAX_RECIPIENTS = parseInt(process.env.MAX_CAMPAIGN_RECIPIENTS) || 10000;
+        if (customers.length > MAX_RECIPIENTS) {
+            return res.status(400).json({ 
+                message: `Campaign audience too large (${customers.length.toLocaleString('en-IN')} customers). Maximum allowed is ${MAX_RECIPIENTS.toLocaleString('en-IN')} recipients.`
+            });
         }
         
-        // Step 2: Create campaign in database
+        // Create campaign in database
         const campaignQuery = `
-            INSERT INTO campaigns (name, message_template, rules_json, created_by, created_at) 
-            VALUES ($1, $2, $3, $4, NOW()) 
+            INSERT INTO campaigns (name, message_template, rules_json, created_by, created_at, status, total_recipients) 
+            VALUES ($1, $2, $3, $4, NOW(), 'processing', $5) 
             RETURNING id
         `;
         const campaignResult = await db.query(campaignQuery, [
-            name,
-            message_template,
+            name.trim(),
+            message_template.trim(),
             JSON.stringify(rules_json),
-            userId
+            userId,
+            customers.length
         ]);
         
         const campaignId = campaignResult.rows[0].id;
+        console.log(`Created campaign ${campaignId} for ${customers.length} customers`);
         
-        // Step 3: Process each customer
+        // Process customers in batches to avoid overwhelming the email service
+        const BATCH_SIZE = 10;
         const emailResults = {
             successful: 0,
             failed: 0,
             errors: []
         };
         
-        for (const customer of customers) {
-            try {
-                // Step 4: Add customer to campaign_customers connection table
-                const connectionQuery = `
-                    INSERT INTO campaign_customers (campaign_id, customer_id, status, created_at) 
-                    VALUES ($1, $2, 'PENDING', NOW()) 
-                    RETURNING id
-                `;
-                const connectionResult = await db.query(connectionQuery, [campaignId, customer.id]);
-                const connectionId = connectionResult.rows[0].id;
-                
-                // Step 5: Send email
-                const emailResult = await sendCampaignEmail(customer, message_template, name);
-                
-                // Step 6: Update status based on email result
-                const status = emailResult.success ? 'SENT' : 'FAILED';
-                const updateQuery = `
-                    UPDATE campaign_customers 
-                    SET status = $1, sent_at = $2, error_message = $3 
-                    WHERE id = $4
-                `;
-                const sentAt = emailResult.success ? new Date() : null;
-                const errorMessage = emailResult.success ? null : emailResult.error;
-                
-                await db.query(updateQuery, [status, sentAt, errorMessage, connectionId]);
-                
-                if (emailResult.success) {
+        for (let i = 0; i < customers.length; i += BATCH_SIZE) {
+            const batch = customers.slice(i, i + BATCH_SIZE);
+            const batchPromises = batch.map(async (customer) => {
+                try {
+                    // Add customer to campaign_customers table
+                    const connectionQuery = `
+                        INSERT INTO campaign_customers (campaign_id, customer_id, status, created_at) 
+                        VALUES ($1, $2, 'PENDING', NOW()) 
+                        RETURNING id
+                    `;
+                    const connectionResult = await db.query(connectionQuery, [campaignId, customer.id]);
+                    const connectionId = connectionResult.rows[0].id;
+                    
+                    // Send email
+                    const emailResult = await sendCampaignEmail(customer, message_template.trim(), name.trim());
+                    
+                    // Update status
+                    const status = emailResult.success ? 'SENT' : 'FAILED';
+                    const updateQuery = `
+                        UPDATE campaign_customers 
+                        SET status = $1, sent_at = $2, error_message = $3 
+                        WHERE id = $4
+                    `;
+                    const sentAt = emailResult.success ? new Date() : null;
+                    const errorMessage = emailResult.success ? null : emailResult.error;
+                    
+                    await db.query(updateQuery, [status, sentAt, errorMessage, connectionId]);
+                    
+                    return {
+                        customerId: customer.id,
+                        email: customer.email,
+                        success: emailResult.success,
+                        error: emailResult.error
+                    };
+                } catch (error) {
+                    console.error(`Error processing customer ${customer.id}:`, error);
+                    return {
+                        customerId: customer.id,
+                        email: customer.email,
+                        success: false,
+                        error: error.message
+                    };
+                }
+            });
+            
+            const batchResults = await Promise.all(batchPromises);
+            
+            batchResults.forEach(result => {
+                if (result.success) {
                     emailResults.successful++;
                 } else {
                     emailResults.failed++;
                     emailResults.errors.push({
-                        customerId: customer.id,
-                        email: customer.email,
-                        error: emailResult.error
+                        customerId: result.customerId,
+                        email: result.email,
+                        error: result.error
                     });
                 }
-                
-            } catch (error) {
-                console.error(`Error processing customer ${customer.id}:`, error);
-                emailResults.failed++;
-                emailResults.errors.push({
-                    customerId: customer.id,
-                    email: customer.email,
-                    error: error.message
-                });
+            });
+            
+            // Small delay between batches
+            if (i + BATCH_SIZE < customers.length) {
+                await new Promise(resolve => setTimeout(resolve, 100));
             }
         }
         
-        // Step 7: Update campaign with final statistics
+        // Update campaign with final statistics
+        const finalStatus = emailResults.failed === 0 ? 'completed' : 
+                          emailResults.successful === 0 ? 'failed' : 'partially_completed';
+        
         const updateCampaignQuery = `
             UPDATE campaigns 
-            SET total_recipients = $1, emails_sent = $2, emails_failed = $3, status = 'completed'
+            SET emails_sent = $1, emails_failed = $2, status = $3
             WHERE id = $4
         `;
         await db.query(updateCampaignQuery, [
-            customers.length,
             emailResults.successful,
             emailResults.failed,
+            finalStatus,
             campaignId
         ]);
         
+        console.log(`Campaign ${campaignId} completed: ${emailResults.successful} sent, ${emailResults.failed} failed`);
+        
         // Return success response
         res.status(201).json({
+            success: true,
             message: "Campaign created and processed successfully",
             campaign: {
                 id: campaignId,
-                name,
+                name: name.trim(),
                 totalCustomers: customers.length,
                 emailsSent: emailResults.successful,
-                emailsFailed: emailResults.failed
+                emailsFailed: emailResults.failed,
+                status: finalStatus
             },
             details: emailResults.failed > 0 ? {
-                errors: emailResults.errors.slice(0, 10) // Return first 10 errors
+                failureRate: ((emailResults.failed / customers.length) * 100).toFixed(1) + '%',
+                sampleErrors: emailResults.errors.slice(0, 5) // Return first 5 errors
             } : null
         });
         
     } catch (error) {
         console.error("Error creating campaign:", error);
-        res.status(500).json({ message: "Server error while creating campaign" });
+        
+        // Try to update campaign status to failed if campaign was created
+        if (error.campaignId) {
+            try {
+                await db.query(
+                    'UPDATE campaigns SET status = $1, completed_at = NOW() WHERE id = $2',
+                    ['failed', error.campaignId]
+                );
+            } catch (updateError) {
+                console.error('Failed to update campaign status:', updateError);
+            }
+        }
+        
+        res.status(500).json({ 
+            message: "Server error while creating campaign",
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+};
+
+// Enhanced preview from prompt with comprehensive AI handling
+export const previewFromPrompt = async (req, res) => {
+    const { prompt } = req.body;
+
+    if (!prompt || prompt.trim().length < 5) {
+        return res.status(400).json({ 
+            message: 'Prompt must be at least 5 characters long',
+            examples: [
+                'Customers who spent over ₹5000',
+                'Users who visited more than 3 times and spent over $1000',
+                'Customers who haven\'t visited in 6 months'
+            ]
+        });
+    }
+
+    try {
+        let parsedRules = null;
+        let method = 'fallback'; // Default to fallback
+        
+        // Check circuit breaker before attempting AI
+        if (checkCircuitBreaker() && process.env.GEMINI_API_KEY) {
+            try {
+                const aiCall = async () => {
+                    const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest';
+                    const model = genAI.getGenerativeModel({ 
+                        model: modelName,
+                        generationConfig: {
+                            temperature: 0.1,
+                            maxOutputTokens: 2000,
+                            topP: 0.95,
+                            topK: 40,
+                        }
+                    });
+                    
+                    const today = new Date().toISOString().split('T')[0];
+                    const instruction = `
+You are an expert system that converts natural language queries into JSON arrays of rule objects for a CRM system.
+
+**CRITICAL REQUIREMENTS:**
+1. Output ONLY a valid JSON array. No explanations, no markdown, no additional text.
+2. Each rule object must have exactly these 4 properties: "field", "operator", "value", "logic"
+3. "field" must be EXACTLY one of: ["Total Spend", "Total Visits", "Last Visit Date"]
+4. "operator" must be EXACTLY one of: [">", "<", "="]  
+5. "value" must be a string (numbers as strings, dates as YYYY-MM-DD)
+6. "logic" must be "AND", "OR", or null (null for the last rule only)
+7. For relative dates, calculate from today: ${today}
+8. Remove currency symbols (₹, $) and convert to plain numbers
+9. Handle common variations (spent/spend, visited/visits, etc.)
+
+**Examples:**
+Input: "Customers who spent over ₹5000"
+Output: [{"field": "Total Spend", "operator": ">", "value": "5000", "logic": null}]
+
+Input: "Users with more than 3 visits and spent over $1000"  
+Output: [{"field": "Total Visits", "operator": ">", "value": "3", "logic": "AND"}, {"field": "Total Spend", "operator": ">", "value": "1000", "logic": null}]
+
+Input: "Customers who haven't visited in 3 months"
+Output: [{"field": "Last Visit Date", "operator": "<", "value": "${new Date(new Date().setMonth(new Date().getMonth() - 3)).toISOString().split('T')[0]}", "logic": null}]
+
+Now convert this prompt: "${prompt.trim()}"
+                    `;
+                    
+                    const result = await model.generateContent(instruction);
+                    const response = await result.response;
+                    let text = response.text();
+                    
+                    // ✅ START OF COMPLETED CODE
+                    
+                    // Clean up potential markdown and extraneous text from the AI response
+                    text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+
+                    // Attempt to parse the cleaned text into a JSON object
+                    const generatedRules = JSON.parse(text);
+
+                    // Validate the structure of the AI-generated rules
+                    const validation = validateRules(generatedRules);
+                    if (!validation.valid) {
+                        // If validation fails, throw an error to trigger the fallback
+                        throw new Error(`AI generated invalid rules: ${validation.message}`);
+                    }
+                    
+                    // If everything is successful, update the state
+                    parsedRules = generatedRules;
+                    method = 'ai';
+                    recordAISuccess(); // Reset the circuit breaker on success
+                };
+
+                // Execute the AI call with retry logic
+                await retryWithBackoff(aiCall);
+
+            } catch (aiError) {
+                console.error("AI service call failed after retries:", aiError.message);
+                recordAIFailure(); // Record the failure for the circuit breaker
+                // Let the code proceed to the fallback mechanism
+            }
+        } else {
+            if (aiServiceState.isCircuitOpen) {
+                console.log('AI service skipped: Circuit breaker is open.');
+            }
+        }
+
+        // If AI failed or was skipped, use the fallback
+        if (!parsedRules) {
+            parsedRules = generateRulesFallback(prompt);
+            method = 'fallback';
+        }
+
+        // If even the fallback fails to produce rules, it's a bad request
+        if (!parsedRules || parsedRules.length === 0) {
+            return res.status(400).json({ 
+                message: "Could not understand the prompt. Please try rephrasing.",
+                prompt
+            });
+        }
+        
+        // --- Final Step: Calculate audience size using the generated rules ---
+        const { query, params } = buildCustomerQuery(parsedRules, true); // countOnly = true
+        const countResult = await db.query(query, params);
+        const audienceCount = parseInt(countResult.rows[0].count, 10);
+
+        // --- Send the final successful response ---
+        res.status(200).json({
+            count: audienceCount,
+            rules: parsedRules,
+            method, // 'ai' or 'fallback'
+            message: `${audienceCount.toLocaleString('en-IN')} customers match the criteria.`
+        });
+
+    } catch (error) {
+        console.error("Critical error in previewFromPrompt:", error);
+        res.status(500).json({ 
+            message: "A server error occurred while processing the prompt.",
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
     }
 };
