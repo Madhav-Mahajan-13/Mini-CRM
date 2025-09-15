@@ -5,6 +5,8 @@ This project is a **monorepo** containing two main parts:
 2. **Frontend (mini-crm)**  
 
 ---
+## Database Schema
+<img width="1528" height="788" alt="supabase-schema-ucjxmckbbjizvgcwugvh" src="https://github.com/user-attachments/assets/511eb20c-dd16-44be-941e-91135d5e0490" />
 
 ## 🖥️ Backend (Server)
 
@@ -108,8 +110,8 @@ The system is composed of four main parts:
     ]
   }
 }
-
-📝 Rules
+```
+##📝 Rules
 
 Rules define how customers are selected for a campaign.
 
@@ -134,15 +136,15 @@ Supported Logic Operators
 AND
 
 OR
-
+```
 Example Rules JSON
 [
   { "field": "Total Spend", "operator": ">", "value": "1000", "logic": "AND" },
   { "field": "Last Visit Date", "operator": ">", "value": "2025-01-01" }
 ]
-
-⚙️ Query Builder
-
+```
+##⚙️ Query Builder
+```
 Example:
 Rules:
 
@@ -157,3 +159,24 @@ SELECT * FROM customers WHERE total_spend > $1
 
 
 With params: [1000]
+```
+##DEMO
+<img width="1919" height="1019" alt="image" src="https://github.com/user-attachments/assets/720b99d7-ec44-4dfa-bc35-6d73931bcb30" />
+<img width="1918" height="1009" alt="image" src="https://github.com/user-attachments/assets/26cadd30-f611-4f40-bafb-23989368326d" />
+<img width="1909" height="930" alt="image" src="https://github.com/user-attachments/assets/8814c7c6-340c-4922-8fdb-3b9942818476" />
+<img width="1917" height="1012" alt="image" src="https://github.com/user-attachments/assets/3f3e20cd-1cd7-4152-8cc1-5488de08d37e" />
+<img width="1918" height="1022" alt="image" src="https://github.com/user-attachments/assets/a64187c7-d65b-4870-82b3-8ce0fdf53dbe" />
+<img width="1919" height="1020" alt="image" src="https://github.com/user-attachments/assets/e4c7e6fe-5b9d-40b8-8268-f9ef3ec18d41" />
+<img width="1919" height="1017" alt="image" src="https://github.com/user-attachments/assets/44a9ec7b-42a8-4f6f-9a1a-0d52dfdbb223" />
+<img width="1361" height="906" alt="image" src="https://github.com/user-attachments/assets/30ad92ee-d629-4483-96c7-f56c94798fba" />
+<img width="1443" height="995" alt="image" src="https://github.com/user-attachments/assets/9387d111-71c7-4c06-92d2-c4cfc9714816" />
+<img width="1442" height="939" alt="image" src="https://github.com/user-attachments/assets/85a8c2f4-e4bb-45a5-b424-d82ed74b08a2" />
+
+
+
+
+
+
+
+
+
