@@ -270,8 +270,8 @@ export const previewaudience = async (req, res) => {
 // Create campaign function
 export const createCampaign = async (req, res) => {
     const { name, message_template, rules_json } = req.body;
-    const userId = 1; // assuming user ID is available in req.user
-    // const userId = req.user.id; // assuming user ID is available in req.user
+    // const userId = 1; // assuming user ID is available in req.user
+    const userId = req.user.id; // assuming user ID is available in req.user
 
     try {
         // Input validation
