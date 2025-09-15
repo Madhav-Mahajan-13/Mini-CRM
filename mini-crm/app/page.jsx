@@ -6,34 +6,63 @@ import { Button } from "@/components/ui/button"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { User, Plus } from "lucide-react"
+// ✨ IMPROVEMENT: Import the auth hook and fetch utility
+import { useAuth, authFetch } from "./utils/auth"
 
 export default function CampaignHistoryPage() {
   const router = useRouter()
+  // ✨ IMPROVEMENT: Use the `useAuth` hook for user state, auth status, and logout function
+  const { user, isAuthenticated, isLoading: isAuthLoading, logout } = useAuth()
+
   const [campaigns, setCampaigns] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
+  // ✨ IMPROVEMENT: Protect the route and fetch data only when authenticated
   useEffect(() => {
-    const fetchCampaigns = async () => {
-      try {
-        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:5000";
-        const res = await fetch(`${backendUrl}/api/users/campaigns/`)
-        if (!res.ok) throw new Error("Failed to fetch campaigns")
-        const data = await res.json()
-        setCampaigns(data.campaigns || [])
-      } catch (err) {
-        console.error(err)
-        setError("Failed to load campaigns")
-      } finally {
-        setLoading(false)
-      }
+    // Redirect if authentication is checked and user is not logged in
+    if (!isAuthLoading && !isAuthenticated) {
+      router.push("/login")
+      return // Stop execution if redirecting
     }
 
-    fetchCampaigns()
-  }, [])
+    // Fetch campaigns only if authenticated
+    if (isAuthenticated) {
+      const fetchCampaigns = async () => {
+        try {
+          // ✨ IMPROVEMENT: Use the centralized `authFetch` utility
+          const res = await authFetch("/api/users/campaigns/")
+          
+          if (!res.ok) {
+            // authFetch handles 401, this handles other server errors (e.g., 500)
+            throw new Error("Failed to fetch campaigns")
+          }
+          
+          const data = await res.json()
+          setCampaigns(data.campaigns || [])
+        } catch (err) {
+          console.error(err)
+          setError(err.message || "Failed to load campaigns")
+        } finally {
+          setLoading(false)
+        }
+      }
+
+      fetchCampaigns()
+    }
+  }, [isAuthLoading, isAuthenticated, router])
 
   const handleCreateCampaign = () => {
     router.push("/create-campaign")
+  }
+
+  // Show a loading screen while checking auth status
+  if (isAuthLoading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <p>Loading...</p>
+      </div>
+    )
   }
 
   return (
@@ -42,13 +71,20 @@ export default function CampaignHistoryPage() {
       <header className="border-b border-border bg-card">
         <div className="container mx-auto px-4 py-4 flex items-center justify-between">
           <h1 className="text-2xl font-bold text-foreground">Mini CRM</h1>
-          <div className="flex items-center gap-2">
-            <Avatar>
-              <AvatarFallback>
-                <User className="h-4 w-4" />
-              </AvatarFallback>
-            </Avatar>
-            <span className="text-sm text-muted-foreground">Demo User</span>
+          <div className="flex items-center gap-4">
+             <div className="flex items-center gap-2">
+                <Avatar>
+                  <AvatarFallback>
+                    <User className="h-4 w-4" />
+                  </AvatarFallback>
+                </Avatar>
+                <div className="flex flex-col text-right">
+                    {/* ✨ IMPROVEMENT: Use `user` object from the `useAuth` hook */}
+                    <span className="text-sm font-medium">{user?.name || "User"}</span>
+                    <span className="text-xs text-muted-foreground">{user?.email || ""}</span>
+                </div>
+             </div>
+             <Button variant="outline" onClick={logout}>Logout</Button>
           </div>
         </div>
       </header>
@@ -81,28 +117,29 @@ export default function CampaignHistoryPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {campaigns.length === 0 && (
+                  {campaigns.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={5} className="text-center text-sm text-muted-foreground">
                         No campaigns found
                       </TableCell>
                     </TableRow>
+                  ) : (
+                    campaigns.map((c) => (
+                      <TableRow key={c.id}>
+                        <TableCell>
+                          <div>
+                            <div className="font-medium">{c.name}</div>
+                            {/* Assuming date might not always be present */}
+                            {c.date && <div className="text-sm text-muted-foreground">{new Date(c.date).toLocaleDateString()}</div>}
+                          </div>
+                        </TableCell>
+                        <TableCell>{c.audienceSize?.toLocaleString() ?? 0}</TableCell>
+                        <TableCell>{c.sent?.toLocaleString() ?? 0}</TableCell>
+                        <TableCell className="text-destructive">{c.failed ?? 0}</TableCell>
+                        <TableCell className="text-amber-600">{c.pending ?? 0}</TableCell>
+                      </TableRow>
+                    ))
                   )}
-
-                  {campaigns.map((c) => (
-                    <TableRow key={c.id}>
-                      <TableCell>
-                        <div>
-                          <div className="font-medium">{c.name}</div>
-                          <div className="text-sm text-muted-foreground">{c.date}</div>
-                        </div>
-                      </TableCell>
-                      <TableCell>{c.audienceSize?.toLocaleString() ?? 0}</TableCell>
-                      <TableCell>{c.sent?.toLocaleString() ?? 0}</TableCell>
-                      <TableCell className="text-destructive">{c.failed ?? 0}</TableCell>
-                      <TableCell className="text-amber-600">{c.pending ?? 0}</TableCell>
-                    </TableRow>
-                  ))}
                 </TableBody>
               </Table>
             )}
