@@ -108,8 +108,8 @@ The system is composed of four main parts:
     ]
   }
 }
-
-📝 Rules
+```
+##📝 Rules
 
 Rules define how customers are selected for a campaign.
 
@@ -134,15 +134,15 @@ Supported Logic Operators
 AND
 
 OR
-
+```
 Example Rules JSON
 [
   { "field": "Total Spend", "operator": ">", "value": "1000", "logic": "AND" },
   { "field": "Last Visit Date", "operator": ">", "value": "2025-01-01" }
 ]
-
-⚙️ Query Builder
-
+```
+##⚙️ Query Builder
+```
 Example:
 Rules:
 
@@ -157,3 +157,4 @@ SELECT * FROM customers WHERE total_spend > $1
 
 
 With params: [1000]
+```
