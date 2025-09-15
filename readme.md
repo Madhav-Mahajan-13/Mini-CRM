@@ -5,6 +5,8 @@ This project is a **monorepo** containing two main parts:
 2. **Frontend (mini-crm)**  
 
 ---
+## Database Schema
+<img width="1528" height="788" alt="supabase-schema-ucjxmckbbjizvgcwugvh" src="https://github.com/user-attachments/assets/511eb20c-dd16-44be-941e-91135d5e0490" />
 
 ## 🖥️ Backend (Server)
 
